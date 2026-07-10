@@ -1,13 +1,4 @@
-"""U-Net denoising network for DDPM.
-
-The U-Net predicts the noise added to an image at a given timestep.
-Architecture:
-  - Encoder: series of downsampling blocks (Conv -> GroupNorm -> SiLU)
-  - Bottleneck: two residual blocks
-  - Decoder: series of upsampling blocks with skip connections from encoder
-  - Time embedding: sinusoidal embedding of timestep t, projected into
-    each residual block via a learned linear layer
-"""
+"""U-Net denoising network for DDPM - fixed architecture."""
 
 import math
 import torch
@@ -65,14 +56,11 @@ class ResidualBlock(nn.Module):
 
 
 class UNet(nn.Module):
-    """U-Net denoising network for DDPM.
+    """U-Net for DDPM.
 
-    Args:
-        in_channels: image channels (1=MNIST, 3=RGB)
-        base_channels: base channel width
-        channel_mults: multipliers at each resolution
-        time_embed_dim: time embedding dimension
-        num_groups: GroupNorm groups
+    Simple fixed architecture:
+      init_conv -> [res, res, downsample] x N -> mid -> [upsample, res, res] x N -> out
+    Skip connections connect each encoder level to the corresponding decoder level.
     """
 
     def __init__(
@@ -85,79 +73,85 @@ class UNet(nn.Module):
     ):
         super().__init__()
         self.time_embedding = TimeEmbedding(time_embed_dim)
-        self.init_conv = nn.Conv2d(in_channels, base_channels, 3, padding=1)
+        td = time_embed_dim
+        ng = num_groups
 
-        # Build channel sizes at each level
-        channels = [base_channels] + [base_channels * m for m in channel_mults]
-        # channels = [base, base*m0, base*m1, ...]
+        ch = [base_channels * m for m in channel_mults]
+        # ch[0], ch[1], ..., ch[-1] from coarse to fine (reversed from mults order)
+        # Actually ch[0]=base*mults[0] is finest, ch[-1] is coarsest
 
-        # Encoder
-        self.downs = nn.ModuleList()
-        self.downsamples = nn.ModuleList()
-        for i in range(len(channel_mults)):
-            in_ch = channels[i]
-            out_ch = channels[i + 1]
-            self.downs.append(nn.ModuleList([
-                ResidualBlock(in_ch, out_ch, time_embed_dim, num_groups),
-                ResidualBlock(out_ch, out_ch, time_embed_dim, num_groups),
+        self.init_conv = nn.Conv2d(in_channels, ch[0], 3, padding=1)
+
+        # Encoder: for each level, two res blocks then downsample
+        self.enc_res = nn.ModuleList()
+        self.enc_ds  = nn.ModuleList()
+        in_c = ch[0]
+        self.enc_channels = []  # track output channels for skip connections
+        for i, out_c in enumerate(ch):
+            self.enc_res.append(nn.ModuleList([
+                ResidualBlock(in_c, out_c, td, ng),
+                ResidualBlock(out_c, out_c, td, ng),
             ]))
-            # Downsample all but last level
-            if i < len(channel_mults) - 1:
-                self.downsamples.append(nn.Conv2d(out_ch, out_ch, 4, 2, 1))
+            self.enc_channels.append(out_c)
+            if i < len(ch) - 1:
+                self.enc_ds.append(nn.Conv2d(out_c, out_c, 4, 2, 1))
             else:
-                self.downsamples.append(nn.Identity())
+                self.enc_ds.append(nn.Identity())
+            in_c = out_c
 
         # Bottleneck
-        bot_ch = channels[-1]
-        self.mid1 = ResidualBlock(bot_ch, bot_ch, time_embed_dim, num_groups)
-        self.mid2 = ResidualBlock(bot_ch, bot_ch, time_embed_dim, num_groups)
+        self.mid = nn.ModuleList([
+            ResidualBlock(ch[-1], ch[-1], td, ng),
+            ResidualBlock(ch[-1], ch[-1], td, ng),
+        ])
 
-        # Decoder
-        self.ups = nn.ModuleList()
-        self.upsamples = nn.ModuleList()
-        for i in reversed(range(len(channel_mults))):
-            in_ch = channels[i + 1]
-            skip_ch = channels[i + 1]
-            out_ch = channels[i]
-            # Upsample all but the last (highest resolution) level
-            if i > 0:
-                self.upsamples.append(nn.ConvTranspose2d(in_ch, in_ch, 4, 2, 1))
-            else:
-                self.upsamples.append(nn.Identity())
-            self.ups.append(nn.ModuleList([
-                ResidualBlock(in_ch + skip_ch, out_ch, time_embed_dim, num_groups),
-                ResidualBlock(out_ch, out_ch, time_embed_dim, num_groups),
+        # Decoder: for each level (reversed), upsample then two res blocks
+        self.dec_us  = nn.ModuleList()
+        self.dec_res = nn.ModuleList()
+        rev_ch = list(reversed(ch))  # from coarsest to finest
+        rev_enc = list(reversed(self.enc_channels))
+
+        in_c = rev_ch[0]
+        for i in range(len(rev_ch) - 1):
+            skip_c = rev_enc[i + 1]
+            out_c  = rev_ch[i + 1]
+            self.dec_us.append(nn.ConvTranspose2d(in_c, in_c, 4, 2, 1))
+            self.dec_res.append(nn.ModuleList([
+                ResidualBlock(in_c + skip_c, out_c, td, ng),
+                ResidualBlock(out_c, out_c, td, ng),
             ]))
+            in_c = out_c
 
-        self.final_norm = nn.GroupNorm(num_groups, channels[1])
-        self.final_conv = nn.Conv2d(channels[1], in_channels, 1)
+        self.final_norm = nn.GroupNorm(ng, ch[0])
+        self.final_conv = nn.Conv2d(ch[0], in_channels, 1)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         t_emb = self.time_embedding(t)
         x = self.init_conv(x)
 
-        # Encoder: save skip connections
+        # Encoder
         skips = []
-        for (res1, res2), ds in zip(self.downs, self.downsamples):
-            x = res1(x, t_emb)
-            x = res2(x, t_emb)
+        for (r1, r2), ds in zip(self.enc_res, self.enc_ds):
+            x = r1(x, t_emb)
+            x = r2(x, t_emb)
             skips.append(x)
             x = ds(x)
 
         # Bottleneck
-        x = self.mid1(x, t_emb)
-        x = self.mid2(x, t_emb)
+        x = self.mid[0](x, t_emb)
+        x = self.mid[1](x, t_emb)
 
-        # Decoder: use skip connections in reverse
-        for (res1, res2), us, skip in zip(self.ups, self.upsamples, reversed(skips)):
+        # Decoder: use all skips in reverse order except the deepest
+        skip_list = list(reversed(skips))
+        for i, (us, (r1, r2)) in enumerate(zip(self.dec_us, self.dec_res)):
             x = us(x)
+            skip = skip_list[i + 1]
             x = torch.cat([x, skip], dim=1)
-            x = res1(x, t_emb)
-            x = res2(x, t_emb)
+            x = r1(x, t_emb)
+            x = r2(x, t_emb)
 
         x = F.silu(self.final_norm(x))
-        x = self.final_conv(x)
-        return x
+        return self.final_conv(x)
 
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
