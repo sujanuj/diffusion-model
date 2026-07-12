@@ -1,0 +1,9 @@
+{
+  "epochs": 10,
+  "total_steps": 5148,
+  "total_time_s": 2712.6402916908264,
+  "final_loss": 0.026589635759592056,
+  "initial_loss": 0.032060906291007996,
+  "n_params": 8933185,
+  "device": "mps"
+}
